@@ -1,16 +1,22 @@
 # ═══════════════════════════════════════════════════════════
-#  SMC Bot - Webhook Receiver (Bước 2 preview)
-#  Stack  : FastAPI + Railway
-#  Purpose: Nhận JSON từ TradingView Pine Script
+#  SMC Trading Bot v2.0
+#  Stack  : FastAPI + tvdatafeed + APScheduler + Railway
+#  Flow   : Fetch TV data → SMC/WR% Agents → Boss → Telegram
 # ═══════════════════════════════════════════════════════════
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import json
+import os
 import logging
 from datetime import datetime
+from contextlib import asynccontextmanager
+
+import pandas as pd
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from tvdatafeed import TvDatafeed, Interval
+
+from agents import smc_agent, wr_bias_agent, boss_agent
+from agents.telegram_notifier import send_signal, send_status
 
 # ─── LOGGING ────────────────────────────────────────────────
 logging.basicConfig(
@@ -19,10 +25,137 @@ logging.basicConfig(
 )
 logger = logging.getLogger("smc_bot")
 
+# ─── CONFIG TỪ ENVIRONMENT VARIABLES ────────────────────────
+TV_USERNAME      = os.getenv("TV_USERNAME", "")
+TV_PASSWORD      = os.getenv("TV_PASSWORD", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SYMBOL           = os.getenv("SYMBOL", "XAUUSD")
+EXCHANGE         = os.getenv("EXCHANGE", "OANDA")
+MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "60"))
+
+# ─── STATE ──────────────────────────────────────────────────
+signal_history = []
+last_analysis  = {}
+bot_stats      = {"runs": 0, "signals_sent": 0, "errors": 0, "started_at": None}
+
+# ─── TVDATAFEED ─────────────────────────────────────────────
+def get_tv():
+    if TV_USERNAME and TV_PASSWORD:
+        return TvDatafeed(TV_USERNAME, TV_PASSWORD)
+    return TvDatafeed()  # anonymous mode
+
+def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch M5 và H1 data từ TradingView"""
+    tv = get_tv()
+    df_m5 = tv.get_hist(
+        symbol=SYMBOL,
+        exchange=EXCHANGE,
+        interval=Interval.in_5_minute,
+        n_bars=100
+    )
+    df_h1 = tv.get_hist(
+        symbol=SYMBOL,
+        exchange=EXCHANGE,
+        interval=Interval.in_1_hour,
+        n_bars=100
+    )
+    # Chuẩn hoá tên cột
+    for df in [df_m5, df_h1]:
+        df.columns = [c.lower() for c in df.columns]
+    return df_m5, df_h1
+
+# ─── MAIN ANALYSIS LOOP ─────────────────────────────────────
+async def run_analysis():
+    """Chạy mỗi 5 phút — fetch data → agents → boss → telegram"""
+    global last_analysis
+    bot_stats["runs"] += 1
+
+    try:
+        logger.info(f"🔄 Run #{bot_stats['runs']} — fetching {SYMBOL} data...")
+
+        df_m5, df_h1 = fetch_data()
+
+        if df_m5 is None or df_h1 is None or df_m5.empty or df_h1.empty:
+            logger.warning("⚠️ Empty data from tvdatafeed")
+            bot_stats["errors"] += 1
+            return
+
+        close = df_m5["close"].iloc[-1]
+        atr   = boss_agent.calculate_atr(df_m5)
+
+        # ── Chạy các Agents ──────────────────────────────────
+        wr_result  = wr_bias_agent.analyze(df_m5, df_h1)
+        smc_result = smc_agent.analyze(df_m5, bias=wr_result["bias"])
+
+        # ── Boss Agent tổng hợp ───────────────────────────────
+        result = boss_agent.generate_signal(
+            smc=smc_result,
+            wr=wr_result,
+            close=close,
+            atr=atr,
+            min_confidence=MIN_CONFIDENCE,
+        )
+
+        last_analysis = {**result, "timestamp": datetime.utcnow().isoformat()}
+
+        logger.info(
+            f"  → Bias: {result['bias']} | WR%: {result['wr_m5']} | "
+            f"Signal: {result['signal']} | Conf: {result['confidence']}%"
+        )
+
+        # ── Gửi Telegram nếu có signal ───────────────────────
+        if result["signal"] in ["BUY", "SELL"] and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            await send_signal(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, result, SYMBOL)
+            bot_stats["signals_sent"] += 1
+
+            # Lưu history
+            signal_history.append({**result, "timestamp": datetime.utcnow().isoformat()})
+            if len(signal_history) > 100:
+                signal_history.pop(0)
+
+    except Exception as e:
+        bot_stats["errors"] += 1
+        logger.error(f"❌ Analysis error: {e}", exc_info=True)
+
+# ─── LIFESPAN (startup / shutdown) ──────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    bot_stats["started_at"] = datetime.utcnow().isoformat()
+
+    # Scheduler chạy mỗi 5 phút
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(run_analysis, "interval", minutes=5, id="analysis")
+    scheduler.start()
+    logger.info("✅ Scheduler started — running every 5 minutes")
+
+    # Notify Telegram bot đã online
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            await send_status(
+                TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                f"🤖 <b>SMC Bot v2.0 Online!</b>\n"
+                f"📊 Symbol: {SYMBOL}\n"
+                f"⏱ Interval: 5 minutes\n"
+                f"🎯 Min confidence: {MIN_CONFIDENCE}%"
+            )
+        except Exception:
+            pass
+
+    # Chạy ngay lần đầu khi khởi động
+    await run_analysis()
+
+    yield
+
+    scheduler.shutdown()
+    logger.info("Bot shutdown")
+
+# ─── FASTAPI APP ─────────────────────────────────────────────
 app = FastAPI(
-    title="SMC Webhook Bot",
-    description="Nhận tín hiệu từ TradingView → xử lý → Telegram",
-    version="1.0.0"
+    title="SMC Trading Bot v2.0",
+    description="XAUUSD SMC + WR% Multi-Agent System",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -32,45 +165,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── PAYLOAD MODEL ──────────────────────────────────────────
-class TVPayload(BaseModel):
-    symbol: str
-    timeframe: str
-    timestamp: str
-    close: float
-    high: float
-    low: float
-    open: float
-    volume: Optional[float] = None
-    atr: Optional[float] = None
-    williams_r: float
-    h1_williams_r: float
-    bias_h1: str                     # BULLISH | BEARISH | NEUTRAL
-    ob_high: Optional[float] = None
-    ob_low: Optional[float] = None
-    fvg_high: Optional[float] = None
-    fvg_low: Optional[float] = None
-    bos: bool
-    bos_direction: str               # BULL | BEAR | NONE
-    signal: str                      # BUY | SELL | WAIT
-    confidence: int                  # 0-100
-    sl: float
-    tp1: float
-    tp2: float
-    rr: float
-    source: Optional[str] = "tradingview"
-
-# ─── STORAGE TẠM (sẽ thay bằng DB sau) ─────────────────────
-signal_history = []
-
 # ─── ENDPOINTS ──────────────────────────────────────────────
-
 @app.get("/")
 async def root():
     return {
         "status": "SMC Bot Online 🟢",
-        "version": "1.0.0",
-        "endpoints": ["/webhook", "/health", "/signals"]
+        "version": "2.0.0",
+        "symbol": SYMBOL,
+        "stats": bot_stats,
     }
 
 @app.get("/health")
@@ -78,96 +180,25 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
-        "signals_received": len(signal_history)
+        "stats": bot_stats,
     }
 
-@app.post("/webhook")
-async def receive_webhook(payload: TVPayload):
-    """
-    Nhận tín hiệu từ TradingView Pine Script
-    """
-    try:
-        logger.info(f"📨 Webhook nhận được: {payload.symbol} | {payload.signal} | conf={payload.confidence}%")
-
-        # Lưu vào history
-        signal_data = payload.dict()
-        signal_data["received_at"] = datetime.utcnow().isoformat()
-        signal_history.append(signal_data)
-
-        # Giữ tối đa 100 signals gần nhất
-        if len(signal_history) > 100:
-            signal_history.pop(0)
-
-        # Log chi tiết
-        logger.info(
-            f"  → Bias H1: {payload.bias_h1} | "
-            f"WR%: {payload.williams_r:.1f} | "
-            f"BOS: {payload.bos} | "
-            f"OB: {payload.ob_low}-{payload.ob_high}"
-        )
-
-        if payload.signal in ["BUY", "SELL"]:
-            logger.info(
-                f"  🎯 SIGNAL: {payload.signal} @ {payload.close} | "
-                f"SL: {payload.sl} | TP1: {payload.tp1} | RR: {payload.rr:.2f}"
-            )
-            # TODO Bước 4: gửi Telegram ở đây
-            # await send_telegram(payload)
-
-        return {
-            "status": "received",
-            "signal": payload.signal,
-            "confidence": payload.confidence,
-            "processed_at": datetime.utcnow().isoformat()
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Lỗi xử lý webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+@app.get("/analysis")
+async def get_analysis():
+    """Xem kết quả analysis gần nhất"""
+    return last_analysis or {"message": "No analysis yet"}
 
 @app.get("/signals")
 async def get_signals(limit: int = 10):
-    """
-    Xem các tín hiệu gần nhất
-    """
+    """Xem signals BUY/SELL gần nhất"""
     recent = signal_history[-limit:] if signal_history else []
     return {
         "total": len(signal_history),
         "signals": list(reversed(recent))
     }
 
-
-@app.post("/webhook/test")
-async def test_webhook():
-    """
-    Test endpoint - gửi payload mẫu để kiểm tra
-    """
-    sample = TVPayload(
-        symbol="XAUUSD",
-        timeframe="5",
-        timestamp="2026-06-08T10:30:00Z",
-        close=3320.50,
-        high=3322.00,
-        low=3318.00,
-        open=3319.00,
-        volume=1234.5,
-        atr=2.850,
-        williams_r=-82.5,
-        h1_williams_r=-75.3,
-        bias_h1="BEARISH",
-        ob_high=3325.00,
-        ob_low=3322.50,
-        fvg_high=3321.00,
-        fvg_low=3319.50,
-        bos=True,
-        bos_direction="BEAR",
-        signal="SELL",
-        confidence=85,
-        sl=3326.20,
-        tp1=3308.50,
-        tp2=3296.00,
-        rr=2.1,
-        source="test"
-    )
-    return await receive_webhook(sample)
+@app.post("/run")
+async def trigger_run():
+    """Trigger analysis thủ công"""
+    await run_analysis()
+    return {"status": "done", "result": last_analysis}
