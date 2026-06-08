@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════
-#  SMC Trading Bot v2.1
-#  Stack  : FastAPI + yfinance + APScheduler + Railway
-#  Flow   : Fetch XAUUSD data → SMC/WR% Agents → Boss → Telegram
+#  SMC Trading Bot v2.2
+#  Stack  : FastAPI + Twelve Data API + APScheduler + Railway
+#  Flow   : Fetch XAUUSD → SMC/WR% Agents → Boss → Telegram
 # ═══════════════════════════════════════════════════════════
 
 import os
@@ -9,8 +9,8 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+import httpx
 import pandas as pd
-import yfinance as yf
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -26,39 +26,60 @@ logging.basicConfig(
 logger = logging.getLogger("smc_bot")
 
 # ─── CONFIG ─────────────────────────────────────────────────
+TWELVE_API_KEY   = os.getenv("TWELVE_API_KEY", "")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SYMBOL_YF        = os.getenv("SYMBOL_YF", "GC=F")   # XAUUSD trên yfinance
+SYMBOL           = os.getenv("SYMBOL", "XAU/USD")
 MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "60"))
+
+TWELVE_BASE = "https://api.twelvedata.com"
 
 # ─── STATE ──────────────────────────────────────────────────
 signal_history = []
 last_analysis  = {}
 bot_stats      = {"runs": 0, "signals_sent": 0, "errors": 0, "started_at": None}
 
-# ─── FETCH DATA ─────────────────────────────────────────────
-def fetch_data() -> tuple:
-    """
-    Fetch XAUUSD M5 và H1 từ yfinance
-    GC=F = Gold Futures (tương đương XAUUSD)
-    """
-    ticker = yf.Ticker(SYMBOL_YF)
+# ─── FETCH DATA FROM TWELVE DATA ────────────────────────────
+async def fetch_ohlcv(interval: str, outputsize: int = 100) -> pd.DataFrame:
+    """Fetch OHLCV từ Twelve Data API"""
+    url = f"{TWELVE_BASE}/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params)
+        data = resp.json()
 
-    # M5 data — lấy 5 ngày gần nhất
-    df_m5 = ticker.history(period="5d", interval="5m")
-    # H1 data — lấy 60 ngày gần nhất
-    df_h1 = ticker.history(period="60d", interval="1h")
+    if "values" not in data:
+        raise Exception(f"Twelve Data error: {data.get('message', data)}")
 
-    # Chuẩn hoá tên cột
-    for df in [df_m5, df_h1]:
-        df.columns = [c.lower() for c in df.columns]
-        df.rename(columns={"stock splits": "stock_splits"}, inplace=True, errors="ignore")
+    df = pd.DataFrame(data["values"])
+    df = df.rename(columns={
+        "datetime": "datetime",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+    })
+    # Convert types
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
-    # Giữ đúng các cột cần thiết
-    cols = ["open", "high", "low", "close", "volume"]
-    df_m5 = df_m5[[c for c in cols if c in df_m5.columns]].dropna()
-    df_h1 = df_h1[[c for c in cols if c in df_h1.columns]].dropna()
+    # Twelve Data trả về mới nhất trước → đảo lại
+    df = df.iloc[::-1].reset_index(drop=True)
+    return df
 
+async def fetch_data():
+    """Fetch M5 và H1 data"""
+    df_m5 = await fetch_ohlcv(interval="5min",  outputsize=100)
+    df_h1 = await fetch_ohlcv(interval="1h",    outputsize=100)
     return df_m5, df_h1
 
 # ─── MAIN ANALYSIS LOOP ─────────────────────────────────────
@@ -67,12 +88,12 @@ async def run_analysis():
     bot_stats["runs"] += 1
 
     try:
-        logger.info(f"🔄 Run #{bot_stats['runs']} — fetching {SYMBOL_YF}...")
+        logger.info(f"🔄 Run #{bot_stats['runs']} — fetching {SYMBOL}...")
 
-        df_m5, df_h1 = fetch_data()
+        df_m5, df_h1 = await fetch_data()
 
         if df_m5.empty or df_h1.empty:
-            logger.warning("⚠️ Empty data")
+            logger.warning("⚠️ Empty data from Twelve Data")
             bot_stats["errors"] += 1
             return
 
@@ -99,9 +120,9 @@ async def run_analysis():
             f"Signal: {result['signal']} | Conf: {result['confidence']}%"
         )
 
-        # ── Gửi Telegram ─────────────────────────────────────
+        # ── Gửi Telegram nếu có signal ───────────────────────
         if result["signal"] in ["BUY", "SELL"] and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-            await send_signal(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, result, "XAUUSD")
+            await send_signal(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, result, SYMBOL)
             bot_stats["signals_sent"] += 1
             signal_history.append({**result, "timestamp": datetime.utcnow().isoformat()})
             if len(signal_history) > 100:
@@ -125,8 +146,9 @@ async def lifespan(app: FastAPI):
         try:
             await send_status(
                 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f"🤖 <b>SMC Bot v2.1 Online!</b>\n"
-                f"📊 Symbol: XAUUSD (GC=F)\n"
+                f"🤖 <b>SMC Bot v2.2 Online!</b>\n"
+                f"📊 Symbol: {SYMBOL}\n"
+                f"📡 Data: Twelve Data API\n"
                 f"⏱ Interval: 5 minutes\n"
                 f"🎯 Min confidence: {MIN_CONFIDENCE}%"
             )
@@ -138,13 +160,12 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 # ─── APP ────────────────────────────────────────────────────
-app = FastAPI(title="SMC Trading Bot v2.1", version="2.1.0", lifespan=lifespan)
-
+app = FastAPI(title="SMC Trading Bot v2.2", version="2.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
 async def root():
-    return {"status": "SMC Bot Online 🟢", "version": "2.1.0", "stats": bot_stats}
+    return {"status": "SMC Bot Online 🟢", "version": "2.2.0", "symbol": SYMBOL, "stats": bot_stats}
 
 @app.get("/health")
 async def health():
@@ -152,7 +173,7 @@ async def health():
 
 @app.get("/analysis")
 async def get_analysis():
-    return last_analysis or {"message": "No analysis yet — chờ 5 phút"}
+    return last_analysis or {"message": "No analysis yet — chờ 1 phút"}
 
 @app.get("/signals")
 async def get_signals(limit: int = 10):
