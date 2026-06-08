@@ -31,6 +31,7 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SYMBOL           = os.getenv("SYMBOL", "XAU/USD")
 MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "60"))
+NOTIFY_ON_START  = os.getenv("NOTIFY_ON_START", "false").lower() == "true"
 
 TWELVE_BASE = "https://api.twelvedata.com"
 
@@ -142,7 +143,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("✅ Scheduler started — every 5 min")
 
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and NOTIFY_ON_START:
         try:
             await send_status(
                 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -184,3 +185,35 @@ async def get_signals(limit: int = 10):
 async def trigger_run():
     await run_analysis()
     return {"status": "done", "result": last_analysis}
+
+# ─── BACKTEST + DASHBOARD ────────────────────────────────────
+from backtest import run_backtest
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os as _os
+if _os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/dashboard")
+async def dashboard():
+    return FileResponse("static/dashboard.html")
+
+backtest_cache = {}
+
+@app.get("/backtest")
+async def get_backtest():
+    """Trả về kết quả backtest cache (nếu có)"""
+    return backtest_cache or {"message": "Chưa có backtest — gọi POST /backtest/run"}
+
+@app.post("/backtest/run")
+async def trigger_backtest():
+    """Chạy backtest 3 tháng (mất ~30-60 giây)"""
+    global backtest_cache
+    try:
+        logger.info("🔬 Starting backtest...")
+        backtest_cache = await run_backtest()
+        logger.info(f"✅ Backtest done: {backtest_cache.get('total_trades')} trades")
+        return backtest_cache
+    except Exception as e:
+        logger.error(f"❌ Backtest error: {e}")
+        return {"error": str(e)}
